@@ -1,0 +1,16 @@
+name: force-prune
+version: 1.0.0
+description: "Adds /prune — force Hermes' deterministic, no-LLM tool-result prune on demand, instead of waiting for compression.proactive_prune_tokens to trigger it mid-turn."
+author: "Jani Ranta"
+kind: standalone
+license: MIT
+homepage: "https://github.com/<your-github-user>/hermes-plugin-force-prune"
+tags:
+  - context
+  - compaction
+  - prune
+  - slash-command
+platforms:
+  - linux
+  - macos
+  - windows
