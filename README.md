@@ -22,8 +22,17 @@ modes. On a local provider a large compaction can stall: a 312K-token
 compaction streamed past its 600s ceiling and aborted without committing,
 leaving the session unusable.
 
-The deterministic prune has no model call, so it cannot stall or time out.
-`/prune` makes it reachable directly, off the chat turn.
+There is also a chicken-and-egg case. Compaction has to *send* the history it
+is compacting, so the transcript must still fit the summariser's context
+window in order to be shrunk. Once you are over that limit — or you switch to
+a model with a smaller window mid-session, so history that fit an hour ago no
+longer does — `/compress` cannot run at all. The one command that would
+recover the session is the one the session has outgrown.
+
+The deterministic prune never sends the transcript anywhere, so no context
+limit applies to it: it cannot stall, time out, or be refused for being too
+large. `/prune` makes it reachable directly, off the chat turn — including as
+a way back from a session `/compress` has already given up on.
 
 ## Install
 
