@@ -28,14 +28,14 @@ The deterministic prune has no model call, so it cannot stall or time out.
 ## Install
 
 ```sh
-hermes plugins install <your-github-user>/hermes-plugin-force-prune
+hermes plugins install Adeas/hermes-plugin-force-prune
 hermes plugins enable force-prune
 ```
 
 Or clone it manually:
 
 ```sh
-git clone https://github.com/<your-github-user>/hermes-plugin-force-prune.git \
+git clone https://github.com/Adeas/hermes-plugin-force-prune.git \
   ~/.hermes/plugins/force-prune
 hermes plugins enable force-prune
 ```

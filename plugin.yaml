@@ -4,7 +4,7 @@ description: "Adds /prune — force Hermes' deterministic, no-LLM tool-result pr
 author: "Jani Ranta"
 kind: standalone
 license: MIT
-homepage: "https://github.com/<your-github-user>/hermes-plugin-force-prune"
+homepage: "https://github.com/Adeas/hermes-plugin-force-prune"
 tags:
   - context
   - compaction
