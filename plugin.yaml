@@ -1,5 +1,5 @@
 name: force-prune
-version: 1.0.0
+version: 1.0.1
 description: "Adds /prune — force Hermes' deterministic, no-LLM tool-result prune on demand, instead of waiting for compression.proactive_prune_tokens to trigger it mid-turn."
 author: "Jani Ranta"
 kind: standalone

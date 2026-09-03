@@ -90,12 +90,17 @@ Only the three **gating** knobs, and nothing else:
 | `proactive_prune_tokens` | history must exceed it | raised to `1` **only if it is `≤ 0`** (feature off); a real configured trigger is left intact, because it also feeds the post-commit runway |
 | below-trigger check | skips the prune under the threshold | skipped, via `current_tokens=None` |
 | `proactive_prune_min_reclaim_tokens` | won't commit a small reclaim | lowered to `1` — *force* means commit whatever is reclaimable |
-| `_proactive_prune_rearm_tokens` | a recent automatic prune vetoes a new one | zeroed, so the veto can't block a manual run. If the prune commits, the method sets and persists its own fresh runway and that value is kept; only a no-op restores the old one |
+| `_proactive_prune_rearm_tokens` | a recent automatic prune vetoes a new one | zeroed, so the veto can't block a manual run. On a commit the method sets and persists its own fresh runway — but it derives that runway from `proactive_prune_min_reclaim_tokens` too, while the override above is still live, so the plugin adds the lost floor back and persists the correction. Only a no-op restores the old runway wholesale |
 
-The recent tail (`compression.protect_last_n`), the head
-(`compression.protect_first_n`) and the session-store capability check are
-**correctness guards and are left alone**. A forced prune never drops content
-the automatic one would have protected.
+The recent tail (`compression.protect_last_n`) and the session-store
+capability check are **left alone**, and the prune is invoked with exactly the
+arguments `prune_tool_results_only` passes itself — so a forced prune never
+drops content the automatic one would have protected.
+
+`compression.protect_first_n` is **not** a guard on this path, despite the
+name: `_prune_old_tool_results` contains no head logic at all, and
+`protect_first_n` only sizes the eligibility floor in the caller's
+message-count gate.
 
 All gates are restored in a `finally` block, so a failure mid-prune cannot
 leave the compressor permanently unlatched.
@@ -113,9 +118,18 @@ leave the compressor permanently unlatched.
   `agent._session_messages` alias the same list once a turn completes, so both
   references are repointed at the pruned list. Otherwise the next turn
   resurrects the unpruned one.
-- **Respects the no-op contract.** If `prune_tool_results_only` cannot commit
-  to the session store it deliberately returns the original transcript; the
-  plugin detects that and reports it rather than claiming success.
+- **Names the gate instead of guessing.** `prune_tool_results_only` collapses
+  every rejection — disabled, below trigger, too few messages, no persistence
+  capability, nothing found, reclaim too small, *and a failed DB commit* — into
+  one `(messages, 0)`. The two structural gates are therefore checked before
+  pruning, so they can be reported precisely; and if a prune still comes back
+  empty, the pure pass is re-run to tell "already compact" apart from "the
+  store rejected the commit". A failed commit is never reported as success, nor
+  as an already-compact transcript.
+- **`--dry-run` cannot over-promise.** The dry pass calls
+  `_prune_old_tool_results` directly and so bypasses those gates; it is run
+  behind the same pre-flight check, so it will not advertise a reclaim that
+  `/prune` would then refuse.
 
 ## Where it looks for your session
 

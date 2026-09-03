@@ -18,9 +18,15 @@ prune has no model call, so it cannot stall or time out. This command makes it
 reachable directly, off the chat turn.
 
 Scope of the override: only the three *gating* knobs are relaxed. The recent
-tail (``protect_last_n``), the head (``protect_first_n``) and the session-store
-capability check are correctness guards and are left alone — a forced prune
-never drops content the automatic one would have protected.
+tail (``protect_last_n``) and the session-store capability check are left
+alone, and the prune is invoked with exactly the arguments
+``prune_tool_results_only`` passes itself — so a forced prune never drops
+content the automatic one would have protected.
+
+``protect_first_n`` is *not* a guard on this path, contrary to what the name
+suggests: ``_prune_old_tool_results`` contains no head logic at all, and
+``protect_first_n`` only sizes the eligibility floor in the caller's
+message-count gate.
 """
 
 from __future__ import annotations
@@ -50,27 +56,48 @@ head (compression.protect_first_n) exactly as the automatic prune does."""
 # Token accounting
 # ---------------------------------------------------------------------------
 
+def _real_estimator() -> Optional[Callable]:
+    """The compressor's own per-message estimator, or ``None`` if unreachable.
+
+    Exposed separately from ``_estimate_tokens`` because one caller needs to
+    know *whether* the real estimator was used, not just the number: the
+    runway correction in ``_force_prune`` is only exact when the reclaim is
+    measured with the same function ``prune_tool_results_only`` used
+    internally.
+    """
+    try:
+        from agent.context_compressor import _estimate_msg_budget_tokens
+
+        return _estimate_msg_budget_tokens
+    except Exception:
+        return None
+
+
 def _estimate_tokens(messages: list) -> int:
     """Best-effort token estimate for a message list.
 
     Prefers the compressor's own estimator so the numbers reported here match
     the ones its internal gates reason about.
     """
-    try:
-        from agent.context_compressor import _estimate_msg_budget_tokens
+    estimator = _real_estimator()
+    if estimator is not None:
+        try:
+            return sum(estimator(m) for m in messages)
+        except Exception:
+            logger.debug("compressor estimator failed; approximating", exc_info=True)
 
-        return sum(_estimate_msg_budget_tokens(m) for m in messages)
-    except Exception:
-        # ~4 chars/token over serialized bodies. Only used for display.
-        total = 0
-        for m in messages or ():
-            try:
-                total += len(str(m.get("content") or "")) // 4
-                for call in m.get("tool_calls") or ():
-                    total += len(str(call)) // 4
-            except Exception:
-                continue
-        return total
+    # ~4 chars/token over serialized bodies. Display only, and deliberately
+    # tokenizer- and model-agnostic: it undercounts CJK and dense code, but it
+    # never gates a decision — every gate is evaluated by the compressor.
+    total = 0
+    for m in messages or ():
+        try:
+            total += len(str(m.get("content") or "")) // 4
+            for call in m.get("tool_calls") or ():
+                total += len(str(call)) // 4
+        except Exception:
+            continue
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +219,109 @@ def _resolve_target() -> tuple[Optional[_Target], Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
+# The gates this command does NOT relax
+# ---------------------------------------------------------------------------
+
+def _blocking_gate(compressor: Any, messages: list) -> Optional[str]:
+    """Name the un-relaxed gate that would make a prune a no-op, if any.
+
+    ``prune_tool_results_only`` collapses every rejection into
+    ``(messages, 0)`` — disabled, below trigger, too few messages, no
+    persistence capability, nothing found, reclaim too small, *and a failed DB
+    commit* all return that exact value. Fine for an automatic caller that
+    only needs "did anything change", but it leaves this command unable to
+    tell a structural refusal from a transcript that is already compact.
+
+    So the two structural gates are evaluated up front, where they can be
+    reported precisely. This also keeps ``--dry-run`` honest: the dry pass
+    calls ``_prune_old_tool_results`` directly and so bypasses both, and would
+    otherwise promise a reclaim that ``/prune`` then refuses.
+    """
+    protect_last = getattr(compressor, "protect_last_n", 20)
+    try:
+        head = compressor._protect_head_size(messages)
+    except Exception:
+        # protect_first_n is defined as *additional* to the system prompt,
+        # which is always implicitly protected — hence the +1.
+        head = getattr(compressor, "protect_first_n", 3) + 1
+
+    floor = protect_last + head + 1
+    if len(messages) <= floor:
+        return (
+            f"Nothing to prune — this session has {len(messages)} messages and "
+            f"the prune needs more than {floor} before anything sits outside "
+            f"the protected head and tail.\n"
+            f"(protect_last_n={protect_last}, protected head={head})"
+        )
+
+    session_db = getattr(compressor, "_session_db", None)
+    session_id = getattr(compressor, "_session_id", "")
+    if (
+        session_db
+        and session_id
+        and not callable(getattr(session_db, "archive_and_compact", None))
+    ):
+        return (
+            "(._.) This session's store cannot commit a prune atomically (no "
+            "archive_and_compact), so the prune would be discarded on the way "
+            "out. Nothing was changed."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # The prune itself
 # ---------------------------------------------------------------------------
+
+def _restore_runway_floor(
+    compressor: Any, saved_trigger: int, saved_min_reclaim: int, reclaimed: int
+) -> None:
+    """Add back the min-reclaim floor the override removed from the runway.
+
+    ``prune_tool_results_only`` computes its post-commit runway as
+    ``max(reclaimed, proactive_prune_tokens, proactive_prune_min_reclaim_tokens)``
+    — and it does so *while this command's overrides are still in force*, so
+    the min-reclaim floor (4096 by default) is replaced by our 1. Left alone
+    that shortens the cache-break spacing the operator configured.
+
+    Only the difference is applied, so the compressor's own arithmetic stays
+    the source of truth. The correction is exact whenever the reclaim was
+    measured with the compressor's own estimator — the caller's precondition —
+    because that is the same function it used internally.
+    """
+    trigger_used = saved_trigger if saved_trigger > 0 else 1
+    applied = max(reclaimed, trigger_used, 1)
+    desired = max(reclaimed, trigger_used, saved_min_reclaim)
+    if desired <= applied:
+        return
+
+    current = getattr(compressor, "_proactive_prune_rearm_tokens", 0)
+    corrected = current + (desired - applied)
+    try:
+        compressor._proactive_prune_rearm_tokens = corrected
+    except Exception:
+        logger.debug("could not set corrected prune runway", exc_info=True)
+        return
+
+    # patch_session_model_config is the documented setter for updating
+    # model_config *without* rewriting the transcript — which
+    # archive_and_compact has already committed by this point.
+    session_db = getattr(compressor, "_session_db", None)
+    session_id = getattr(compressor, "_session_id", "")
+    patcher = getattr(session_db, "patch_session_model_config", None)
+    if not session_id or not callable(patcher):
+        return
+    try:
+        from agent.context_compressor import (
+            PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY as key,
+        )
+    except Exception:
+        key = "_proactive_prune_rearm_tokens"
+    try:
+        patcher(session_id, {key: corrected})
+    except Exception:
+        logger.debug("could not persist corrected prune runway", exc_info=True)
+
 
 def _force_prune(compressor: Any, messages: list) -> tuple[list, int]:
     """Run ``prune_tool_results_only`` with the automatic gates relaxed.
@@ -209,12 +337,23 @@ def _force_prune(compressor: Any, messages: list) -> tuple[list, int]:
       means commit whatever is reclaimable, not just a large batch.
 
     The disarm runway is zeroed so a recent automatic prune can't veto this
-    run. If the prune commits, the method sets its own fresh runway (and
-    persists it) — that value is kept. Only a no-op restores the old one.
+    run. If the prune commits, the method sets its own fresh runway and
+    persists it — but it derives that runway from
+    ``proactive_prune_min_reclaim_tokens`` too, while the override above is
+    still live, so ``_restore_runway_floor`` adds the lost floor back. Only a
+    no-op restores the old runway wholesale.
     """
     saved_trigger = getattr(compressor, "proactive_prune_tokens", 0)
     saved_min_reclaim = getattr(compressor, "proactive_prune_min_reclaim_tokens", 0)
     saved_rearm = getattr(compressor, "_proactive_prune_rearm_tokens", 0)
+
+    # Measured before the call: the prune passes rewrite message bodies in
+    # place, so reading ``messages`` afterwards would report post-prune sizes.
+    estimator = _real_estimator()
+    try:
+        before = sum(estimator(m) for m in messages) if estimator else None
+    except Exception:
+        before = None
 
     try:
         if saved_trigger <= 0:
@@ -240,6 +379,16 @@ def _force_prune(compressor: Any, messages: list) -> tuple[list, int]:
             compressor._proactive_prune_rearm_tokens = saved_rearm
         except Exception:
             logger.debug("could not restore prune runway", exc_info=True)
+        return pruned, count
+
+    if before is not None and estimator is not None:
+        try:
+            after = sum(estimator(m) for m in pruned)
+            _restore_runway_floor(
+                compressor, saved_trigger, saved_min_reclaim, max(0, before - after)
+            )
+        except Exception:
+            logger.debug("could not correct prune runway floor", exc_info=True)
 
     return pruned, count
 
@@ -263,6 +412,43 @@ def _dry_run(compressor: Any, messages: list) -> tuple[list, int]:
 # ---------------------------------------------------------------------------
 # Slash handler
 # ---------------------------------------------------------------------------
+
+def _explain_zero(
+    compressor: Any,
+    target: "_Target",
+    before_msgs: int,
+    before_tokens: int,
+    dry: bool,
+) -> str:
+    """Tell "already compact" apart from "the commit was rejected".
+
+    Both arrive as ``count == 0``. The structural gates were cleared before
+    the prune ran, so what is left is a genuinely compact transcript, a
+    reclaim that measured zero, or a failed ``archive_and_compact``. Re-running
+    the pure pass is the only way to tell them apart — if it finds prunable
+    results, the transcript was not the problem.
+    """
+    compact = (
+        f"Nothing to prune in {target.label} — "
+        f"{before_msgs} messages, ~{before_tokens:,} tokens.\n"
+        "Everything outside the protected tail is already compact."
+    )
+    if dry:
+        return compact
+    try:
+        _, prunable = _dry_run(compressor, target.messages)
+    except Exception:
+        logger.debug("post-prune diagnostic scan failed", exc_info=True)
+        return compact
+    if not prunable:
+        return compact
+    return (
+        f"(._.) {prunable} tool result(s) were prunable, but the prune was not "
+        f"committed — the session store rejected it, or the reclaim measured "
+        f"zero.\nThe transcript was left untouched. See the agent log for "
+        f"details."
+    )
+
 
 def _handle_slash(raw_args: str) -> str:
     args = (raw_args or "").strip().lower()
@@ -288,6 +474,10 @@ def _handle_slash(raw_args: str) -> str:
             "(a plugin context engine may have replaced the built-in compressor)."
         )
 
+    gate = _blocking_gate(compressor, target.messages)
+    if gate:
+        return gate
+
     before_msgs = len(target.messages)
     before_tokens = _estimate_tokens(target.messages)
 
@@ -301,11 +491,7 @@ def _handle_slash(raw_args: str) -> str:
         return f"(._.) Prune failed: {exc}"
 
     if not count:
-        return (
-            f"Nothing to prune in {target.label} — "
-            f"{before_msgs} messages, ~{before_tokens:,} tokens.\n"
-            "Everything outside the protected tail is already compact."
-        )
+        return _explain_zero(compressor, target, before_msgs, before_tokens, dry)
 
     after_tokens = _estimate_tokens(pruned)
     reclaimed = max(0, before_tokens - after_tokens)
@@ -318,14 +504,6 @@ def _handle_slash(raw_args: str) -> str:
             f"  tokens    ~{before_tokens:,} → ~{after_tokens:,} "
             f"(would reclaim ~{reclaimed:,})\n"
             "Nothing was changed. Run /prune to commit."
-        )
-
-    if pruned is target.messages:
-        # prune_tool_results_only's no-op contract: the DB commit failed and it
-        # deliberately kept the original transcript.
-        return (
-            "(._.) The prune could not be committed to the session store; "
-            "the transcript was left untouched. See the agent log for details."
         )
 
     target.commit(pruned)
